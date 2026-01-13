@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 import json
-import networkx as nx
+import yaml
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, field, asdict
@@ -17,11 +17,12 @@ class Signal(str, Enum):
     CRASH = "CRASH"
     HANG = "HANG"
 
-class NodeType(int, Enum):
-    AST = 0
-    RULE = 1
-    META = 2
-    ATTRIBUTION = 3  # New: Explicit link between rule and AST
+class GrammarRuleType(str, Enum):
+    STRUCTURAL = "structural"
+    OPERATION = "operation"
+    DECLARATION = "declaration"
+    LITERAL = "literal"
+    CONTROL_FLOW = "control_flow"
 
 FILES = {
 # ---------------- CONFIG ----------------
@@ -35,6 +36,579 @@ BinaryExpr ::= Expr "+" Expr {add_expr} | Expr "-" Expr {sub_expr} | Expr "*" Ex
 CallExpr ::= Identifier "(" ExprList ")" {call}
 ExprList ::= Expr {single_arg} | Expr "," ExprList {multi_args}
 Literal ::= Number {num_literal} | String {str_literal}
+Number ::= [0-9]+ {integer}
+String ::= "\"" [a-zA-Z]* "\"" {simple_string}
+Identifier ::= [a-zA-Z_][a-zA-Z0-9_]* {identifier}
+""",
+
+"config/grammar_schema.yaml": r"""
+version: "2.0.0"
+rules:
+  program:
+    type: "structural"
+    base_probability: 1.0
+    risk_score: 0.0
+  statement:
+    type: "structural"
+    base_probability: 0.5
+    risk_score: 0.0
+  vardecl:
+    type: "statement"
+    base_probability: 0.3
+    risk_score: 0.1
+  var_assign:
+    type: "declaration"
+    base_probability: 0.15
+    risk_score: 0.05
+  div_expr:
+    type: "operation"
+    base_probability: 0.1
+    risk_score: 0.3
+    comment: "Division can cause division by zero"
+entropy_constraints:
+  min_rule_probability: 0.01
+  max_rule_probability: 0.95
+  target_shannon_entropy: 2.5
+""",
+
+"config/v8_flags.json": r"""
+{
+  "common": [
+    "--trace-deopt",
+    "--trace-opt",
+    "--allow-natives-syntax",
+    "--logfile=%LOG%",
+    "--log-all",
+    "--predictable"
+  ],
+  "debug": [
+    "--gc-interval=100",
+    "--stack-size=1000",
+    "--always-opt",
+    "--max-opt-count=100"
+  ],
+  "asan": [
+    "--enable-slow-asserts",
+    "--verify-heap",
+    "--abort-on-contradictory-flags"
+  ]
+}
+""",
+
+# ---------------- CORE ----------------
+"core/config.py": r"""
+from pydantic import BaseModel, Field, validator
+from pathlib import Path
+from typing import Dict, List, Optional
+from datetime import datetime
+
+class V8FlagsConfig(BaseModel):
+    common: List[str] = Field(default_factory=list)
+    debug: List[str] = Field(default_factory=list)
+    asan: List[str] = Field(default_factory=list)
+    
+    @validator('*')
+    def validate_flags(cls, v):
+        return [f.strip() for f in v if f.strip()]
+
+class GrammarRuleSchema(BaseModel):
+    type: str
+    base_probability: float = Field(ge=0.0, le=1.0)
+    risk_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    max_depth: Optional[int] = Field(default=None, gt=0)
+    
+    class Config:
+        extra = "allow"
+
+class EntropyConstraints(BaseModel):
+    min_rule_probability: float = Field(ge=0.001, le=0.1)
+    max_rule_probability: float = Field(ge=0.5, le=1.0)
+    target_shannon_entropy: float = Field(ge=1.0, le=4.0)
+
+class GrammarSchema(BaseModel):
+    version: str
+    rules: Dict[str, GrammarRuleSchema]
+    entropy_constraints: EntropyConstraints
+    
+    @validator('rules')
+    def validate_rule_probabilities(cls, v):
+        if not v:
+            raise ValueError("At least one rule must be defined")
+        return v
+
+class JITFuzzConfig:
+    def __init__(self, config_dir: Path = Path("config")):
+        self.config_dir = Path(config_dir)
+        self.grammar_schema: Optional[GrammarSchema] = None
+        self.v8_flags: Optional[V8FlagsConfig] = None
+        
+    def load(self) -> None:
+        self._load_grammar_schema()
+        self._load_v8_flags()
+        
+    def _load_grammar_schema(self) -> None:
+        path = self.config_dir / "grammar_schema.yaml"
+        if not path.exists():
+            raise FileNotFoundError(f"Grammar schema not found: {path}")
+        
+        with open(path) as f:
+            data = yaml.safe_load(f)
+            self.grammar_schema = GrammarSchema(**data)
+    
+    def _load_v8_flags(self) -> None:
+        path = self.config_dir / "v8_flags.json"
+        if not path.exists():
+            raise FileNotFoundError(f"V8 flags not found: {path}")
+        
+        with open(path) as f:
+            self.v8_flags = V8FlagsConfig(**json.load(f))
+    
+    def save_grammar_probs(self, probabilities: Dict[str, float], 
+                          version: str = None) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        version = version or f"v{timestamp}"
+        
+        for rule_id, prob in probabilities.items():
+            if rule_id in self.grammar_schema.rules:
+                self.grammar_schema.rules[rule_id].base_probability = prob
+        
+        output_path = self.config_dir / f"grammar_schema.{version}.yaml"
+        with open(output_path, "w") as f:
+            yaml.dump(self.grammar_schema.dict(), f, indent=2)
+        
+        return output_path
+
+class ConfigManager:
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    def initialize(self, config_dir: Path = Path("config")):
+        if not self._initialized:
+            self.config = JITFuzzConfig(config_dir)
+            self.config.load()
+            self._initialized = True
+    
+    @property
+    def grammar(self) -> GrammarSchema:
+        return self.config.grammar_schema
+    
+    @property
+    def flags(self) -> V8FlagsConfig:
+        return self.config.v8_flags
+""",
+
+"core/utils.py": r"""
+import logging
+import sys
+from pathlib import Path
+from datetime import datetime
+import hashlib
+import time
+
+class TraceLogger:
+    def __init__(self, log_dir: Path = Path("logs")):
+        self.log_dir = log_dir
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = log_dir / f"trace_{timestamp}.log"
+        
+        self.logger = logging.getLogger("jitfuzz")
+        self.logger.setLevel(logging.DEBUG)
+        
+        # File handler
+        fh = logging.FileHandler(self.log_file)
+        fh.setLevel(logging.DEBUG)
+        
+        # Console handler
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.INFO)
+        
+        formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)-8s | %(module)-15s | %(message)s',
+            datefmt='%H:%M:%S'
+        )
+        fh.setFormatter(formatter)
+        ch.setFormatter(formatter)
+        
+        self.logger.addHandler(fh)
+        self.logger.addHandler(ch)
+    
+    def debug(self, msg: str, **kwargs):
+        self.logger.debug(msg + (f" | {kwargs}" if kwargs else ""))
+    
+    def info(self, msg: str, **kwargs):
+        self.logger.info(msg + (f" | {kwargs}" if kwargs else ""))
+    
+    def warning(self, msg: str, **kwargs):
+        self.logger.warning(msg + (f" | {kwargs}" if kwargs else ""))
+    
+    def error(self, msg: str, **kwargs):
+        self.logger.error(msg + (f" | {kwargs}" if kwargs else ""))
+
+_logger = TraceLogger()
+debug = _logger.debug
+info = _logger.info
+warning = _logger.error
+error = _logger.error
+
+def compute_hash(data: str) -> str:
+    return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+def timeit(func):
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        result = func(*args, **kwargs)
+        debug(f"{func.__name__} took {time.time() - start:.3f}s")
+        return result
+    return wrapper
+""",
+
+"core/artifact.py": r"""
+from dataclasses import dataclass, field, asdict
+from typing import Dict, List, Optional, Tuple, Any
+from enum import Enum
+from datetime import datetime
+from core.utils import debug, compute_hash, timeit
+from collections import Counter
+
+class SignalLabel(str, Enum):
+    NORMAL = "NORMAL"
+    JS_EXCEPTION = "JS_EXCEPTION"
+    ABORT = "ABORT"
+    CRASH = "CRASH"
+    HANG = "HANG"
+    JIT_ASSUMPTION_VIOLATION = "JIT_ASSUMPTION_VIOLATION"
+    MEMORY_CORRUPTION = "MEMORY_CORRUPTION"
+
+@dataclass(frozen=True)
+class SourceLocation:
+    start_line: int
+    start_column: int
+    end_line: int
+    end_column: int
+
+@dataclass(frozen=True)
+class RuleInstance:
+    rule_id: str
+    instance_id: str
+    parent_instance: Optional[str]
+    ast_node_ids: List[str] = field(default_factory=list)
+    depth: int
+    token_range: Tuple[int, int]
+    expansion: str
+    rule_type: GrammarRuleType
+    location: Optional[SourceLocation] = None
+    
+    def to_graph_node(self) -> Dict[str, Any]:
+        return {
+            "node_id": f"RULE::{self.instance_id}",
+            "type": "rule",
+            "rule_id": self.rule_id,
+            "rule_type": self.rule_type.value,
+            "depth": self.depth,
+            "expansion_length": len(self.expansion),
+            "hash": compute_hash(self.expansion)[:8]
+        }
+
+@dataclass
+class JITTelemetry:
+    deopt_count: int = 0
+    tier_transitions: int = 0
+    compilation_count: int = 0
+    deopt_reasons: List[str] = field(default_factory=list)
+    optimized_function_count: int = 0
+    bailout_count: int = 0
+    
+    @classmethod
+    def from_stderr(cls, stderr: str) -> "JITTelemetry":
+        lines = stderr.split('\\n')
+        deopt_reasons = []
+        deopt_count = 0
+        
+        for line in lines:
+            if "deoptimizing" in line.lower():
+                deopt_count += 1
+                if "reason:" in line.lower():
+                    reason = line.split("reason:")[-1].strip()
+                    deopt_reasons.append(reason[:100])
+        
+        return cls(
+            deopt_count=deopt_count,
+            deopt_reasons=deopt_reasons,
+            tier_transitions=lines.count("marking")
+        )
+
+@dataclass
+class RuntimeResult:
+    label: SignalLabel
+    exit_code: int
+    exec_time_ms: int
+    stdout: str
+    stderr: str
+    jit_telemetry: JITTelemetry
+    signal_strength: float = 1.0
+    memory_used_mb: Optional[float] = None
+    
+    @property
+    def is_unstable(self) -> bool:
+        unstable_labels = {
+            SignalLabel.CRASH, SignalLabel.ABORT, SignalLabel.HANG,
+            SignalLabel.MEMORY_CORRUPTION, SignalLabel.JIT_ASSUMPTION_VIOLATION
+        }
+        return self.label in unstable_labels
+    
+    @property
+    def severity_score(self) -> float:
+        base_scores = {
+            SignalLabel.MEMORY_CORRUPTION: 1.0,
+            SignalLabel.CRASH: 0.9,
+            SignalLabel.ABORT: 0.8,
+            SignalLabel.HANG: 0.7,
+            SignalLabel.JIT_ASSUMPTION_VIOLATION: 0.6,
+            SignalLabel.JS_EXCEPTION: 0.3,
+            SignalLabel.NORMAL: 0.0
+        }
+        
+        base = base_scores.get(self.label, 0.5)
+        deopt_multiplier = min(1.0 + (self.jit_telemetry.deopt_count * 0.05), 1.5)
+        return min(base * self.signal_strength * deopt_multiplier, 1.0)
+
+@dataclass
+class ProgramArtifact:
+    program_id: str
+    seed: int
+    source: str
+    source_hash: str
+    rule_trace: List[RuleInstance]
+    runtime: RuntimeResult
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    generation_time: datetime = field(default_factory=datetime.now)
+    ast: Optional[Dict[str, Any]] = None
+    
+    def __post_init__(self):
+        if not self.source_hash:
+            self.source_hash = compute_hash(self.source)
+    
+    @timeit
+    def get_rule_frequency(self) -> Dict[str, int]:
+        return Counter(rule.rule_id for rule in self.rule_trace)
+    
+    @timeit
+    def get_rule_coverage(self) -> float:
+        if not self.source:
+            return 0.0
+        
+        coverage_mask = [False] * len(self.source)
+        for rule in self.rule_trace:
+            start, end = rule.token_range
+            for i in range(max(0, start), min(end, len(self.source))):
+                if i < len(coverage_mask):
+                    coverage_mask[i] = True
+        
+        covered = sum(1 for i, ch in enumerate(self.source) 
+                     if coverage_mask[i] and not ch.isspace())
+        total = sum(1 for ch in self.source if not ch.isspace())
+        return covered / max(total, 1)
+    
+    @timeit
+    def get_critical_rules(self, top_k: int = 5) -> List[Tuple[str, float]]:
+        if not self.runtime.is_unstable:
+            return []
+        
+        rule_freq = self.get_rule_frequency()
+        critical = []
+        
+        for rule_id, count in rule_freq.items():
+            positions = [i for i, r in enumerate(self.rule_trace) if r.rule_id == rule_id]
+            avg_position = sum(positions) / max(len(positions), 1)
+            
+            criticality = count * self.runtime.signal_strength * (1.0 + avg_position / len(self.rule_trace))
+            critical.append((rule_id, criticality))
+        
+        critical.sort(key=lambda x: x[1], reverse=True)
+        return critical[:top_k]
+    
+    def to_json(self) -> str:
+        debug(f"Serializing artifact {self.program_id}")
+        data = asdict(self)
+        data['generation_time'] = self.generation_time.isoformat()
+        data['runtime']['jit_telemetry'] = asdict(self.runtime.jit_telemetry)
+        return json.dumps(data, indent=2)
+    
+    @classmethod
+    def from_json(cls, json_str: str) -> "ProgramArtifact":
+        data = json.loads(json_str)
+        data['generation_time'] = datetime.fromisoformat(data['generation_time'])
+        data['runtime']['jit_telemetry'] = JITTelemetry(**data['runtime']['jit_telemetry'])
+        data['rule_trace'] = [RuleInstance(**r) for r in data['rule_trace']]
+        data['runtime'] = RuntimeResult(**data['runtime'])
+        return cls(**data)
+""",
+
+"core/generator.py": r"""
+import subprocess
+import tempfile
+import json
+from pathlib import Path
+from typing import Tuple, List, Optional
+from core.utils import debug, info, warning, error, timeit
+from core.artifact import RuleInstance, GrammarRuleType
+
+class DharmaGenerator:
+    def __init__(self, grammar_path: Path, dharma_bin: str = "dharma", 
+                 grammar_config_path: Optional[Path] = None):
+        self.grammar_path = Path(grammar_path)
+        self.dharma_bin = dharma_bin
+        self.grammar_config = None
+        
+        if grammar_config_path:
+            with open(grammar_config_path) as f:
+                self.grammar_config = json.load(f)
+        
+        try:
+            subprocess.run([dharma_bin, "--version"], 
+                         capture_output=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            warning(f"Dharma binary {dharma_bin} not found")
+    
+    @timeit
+    def generate(self, seed: int, max_depth: int = 10) -> Tuple[str, List[RuleInstance]]:
+        debug(f"Generating with seed {seed}, max_depth={max_depth}")
+        
+        with tempfile.TemporaryDirectory() as tmp:
+            js_path = Path(tmp) / "out.js"
+            trace_path = Path(tmp) / "trace.json"
+            
+            cmd = [
+                self.dharma_bin,
+                "--grammar", str(self.grammar_path),
+                "--seed", str(seed),
+                "--max-depth", str(max_depth),
+                "--emit-js", str(js_path),
+                "--emit-trace", str(trace_path),
+                "--format", "json"
+            ]
+            
+            try:
+                subprocess.check_call(cmd, stdout=subprocess.DEVNULL, 
+                                    stderr=subprocess.DEVNULL)
+            except subprocess.CalledProcessError as e:
+                error(f"Dharma generation failed: {e}")
+                raise
+            
+            source = js_path.read_text(encoding='utf-8')
+            trace = self._parse_trace(trace_path, source)
+            
+            info(f"Generated {len(source)} chars, {len(trace)} rules")
+            return source, trace
+    
+    def _parse_trace(self, trace_path: Path, source: str) -> List[RuleInstance]:
+        try:
+            with open(trace_path) as f:
+                raw_trace = json.load(f)
+        except json.JSONDecodeError as e:
+            error(f"Failed to parse trace JSON: {e}")
+            return []
+        
+        rule_instances = []
+        
+        for item in raw_trace:
+            required = ['rule_id', 'instance_id', 'ast_node_id', 'token_start', 'token_end']
+            if not all(field in item for field in required):
+                warning(f"Skipping trace item missing fields: {item}")
+                continue
+            
+            rule_type = GrammarRuleType.STRUCTURAL
+            if self.grammar_config:
+                rule_info = self.grammar_config['rules'].get(item['rule_id'], {})
+                rule_type = GrammarRuleType(rule_info.get('type', 'structural'))
+            
+            token_start = item['token_start']
+            token_end = min(item['token_end'], len(source))
+            expansion = source[token_start:token_end]
+            
+            instance = RuleInstance(
+                rule_id=item['rule_id'],
+                instance_id=item['instance_id'],
+                parent_instance=item.get('parent_instance'),
+                ast_node_ids=[item['ast_node_id']],
+                depth=item.get('depth', 0),
+                token_range=(token_start, token_end),
+                expansion=expansion,
+                rule_type=rule_type
+            )
+            rule_instances.append(instance)
+        
+        rule_instances.sort(key=lambda x: x.depth)
+        debug(f"Parsed {len(rule_instances)} rule instances")
+        return rule_instances
+    
+    def validate_trace_coverage(self, source: str, trace: List[RuleInstance]) -> bool:
+        if not trace:
+            return False
+        
+        coverage = [False] * len(source)
+        for rule in trace:
+            start, end = rule.token_range
+            for i in range(start, min(end, len(source))):
+                if i < len(coverage):
+                    coverage[i] = True
+        
+        uncovered = sum(1 for i, covered in enumerate(coverage) 
+                       if not covered and not source[i].isspace())
+        coverage_ratio = 1 - (uncovered / max(1, len(source)))
+        debug(f"Trace coverage: {coverage_ratio:.2%}")
+        
+        return coverage_ratio > 0.95
+""",
+
+"core/signals.py": r"""
+import re
+from enum import Enum
+from typing import Dict, Any
+from core.utils import debug
+
+class V8Signal(str, Enum):
+    NORMAL = "NORMAL"
+    JS_EXCEPTION = "JS_EXCEPTION"
+    ABORT = "ABORT"
+    CRASH = "CRASH"
+    HANG = "HANG"
+    JIT_ASSUMPTION_VIOLATION = "JIT_ASSUMPTION_VIOLATION"
+    MEMORY_CORRUPTION = "MEMORY_CORRUPTION"
+
+class SignalClassifier:
+    JS_ERROR_PATTERNS = [
+        (re.compile(r"SyntaxError"), "JS_EXCEPTION"),
+        (re.compile(r"TypeError"), "JS_EXCEPTION"),
+        (re.compile(r"ReferenceError"), "JS_EXCEPTION"),
+        (re.compile(r"RangeError"), "JS_EXCEPTION"),
+        (re.compile(r"MemoryError"), "MEMORY_CORRUPTION")
+    ]
+    
+    V8_ABORT_PATTERNS = [
+        (re.compile(r"CHECK failed"), "ABORT"),
+        (re.compile(r"DCHECK failed"), "ABORT"),
+        (re.compile(r"# Fatal error"), "ABORT"),
+        (re.compile(r"#\s*Assertion failed"), "ABORT")
+    ]
+    
+    JIT_SPECIFIC_PATTERNS = [
+        (re.compile(r"deoptimization bailout"), "JIT_ASSUMPTION_VIOLATION"),
+        (re.compile(r"wrong map"), "JIT_ASSUMPTION_VIOLATION"),
+        (re.compile(r"not a Smi"), "JIT_ASSUMPTION_VIOLATION"),
+        (re.compile(r"not a HeapNumber"), "JIT_ASSUMPTION_VIOLATION"),
+        (re.compile(r"bailout reason"), "JIT_ASSUMPTION_VIOLATION")
+    ]
+    
+    MEMORY_PATTERNS = [
+        (re.compile(r"AddressSanitizer"), "MEMORY_CORRUPTION"),
+        (re.compile(r"heap-bufferLiteral ::= Number {num_literal} | String {str_literal}
 Number ::= [0-9]+ {integer}
 String ::= "\"" [a-zA-Z]* "\"" {simple_string}
 Identifier ::= [a-zA-Z_][a-zA-Z0-9_]* {identifier}
