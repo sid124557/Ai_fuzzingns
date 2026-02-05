@@ -12,6 +12,52 @@ BASE_TEMPLATE = r"""
 // V8 SEGFAULT FUZZ TEMPLATE
 // ============================================================================
 
+const ATTACKER_COUNT = {attacker_count};
+
+function makeAttackers(seed) {{
+  let attackers = new Array(ATTACKER_COUNT);
+  let x = seed | 0;
+  for (let i = 0; i < attackers.length; i++) {{
+    x = (x * 1103515245 + 12345) | 0;
+    let mode = x & 7;
+    attackers[i] = function attacker(slot, target) {{
+      switch (mode) {{
+        case 0:
+          target.length = (slot & 3) + 1;
+          return target[slot];
+        case 1: {{
+          let tmp = new Array(8);
+          tmp[0] = target;
+          tmp[1] = tmp;
+          return tmp[(slot ^ 1) & 7];
+        }}
+        case 2: {{
+          let t = new Uint8Array(64);
+          t[slot & 63] = slot & 255;
+          return t[slot & 63];
+        }}
+        case 3: {{
+          let map = new Map();
+          map.set("k", target);
+          map.set(slot, slot + 0.1);
+          return map.get("k");
+        }}
+        case 4:
+          delete target[slot & 3];
+          return target[slot & 3];
+        case 5:
+          target[slot & 1] = {ptr: slot, tag: "obj"};
+          return target[slot & 1];
+        case 6:
+          return Math.imul(slot, 1337) ^ (slot >>> 1);
+        default:
+          return (slot + 0.5) / (slot + 1);
+      }}
+    }};
+  }}
+  return attackers;
+}}
+
 function vulnerableRead(arr) {
   let len = arr.length;
   return arr[len + {oob_offset}];
@@ -37,6 +83,7 @@ for (let i = 0; i < 5; i++) {
 delete victim[2]; // HOLEY_DOUBLE_ELEMENTS
 
 let callCount = 0;
+let attackers = makeAttackers({seed});
 
 let proxy = new Proxy(victim, {
   get(target, prop, receiver) {
@@ -99,12 +146,23 @@ let exceptions = 0;
 for (let i = 0; i < {iterations}; i++) {
   try {
     let val = vulnerableRead(proxy);
+    let attacker = attackers[i % attackers.length];
+    let havoc = attacker(i, victim);
 
     if (val !== undefined && val !== null && typeof val === 'object') {
       try {
         Object.keys(val);
         val.toString();
         JSON.stringify(val);
+      } catch (innerE) {
+        // swallow
+      }
+    }
+
+    if (havoc && typeof havoc === 'object') {
+      try {
+        if (Array.isArray(havoc)) havoc.length = 1;
+        if (havoc && havoc.buffer) new Uint8Array(havoc.buffer);
       } catch (innerE) {
         // swallow
       }
@@ -169,11 +227,15 @@ def random_params(rng: random.Random) -> dict:
         "iterations": rng.randint(50, 400),
         "outer_gc_interval": rng.randint(1, 6),
         "spin": rng.randint(200, 2000),
+        "attacker_count": rng.randint(500, 10000),
+        "seed": rng.randint(1, 1_000_000),
     }
 
 
-def render_case(case_id: str, rng: random.Random) -> str:
+def render_case(case_id: str, rng: random.Random, attacker_count: int | None) -> str:
     params = random_params(rng)
+    if attacker_count is not None:
+        params["attacker_count"] = attacker_count
     return BASE_TEMPLATE.format(**params), params
 
 
@@ -203,6 +265,12 @@ def main() -> int:
     parser.add_argument("--iterations", type=int, default=50, help="Number of fuzz iterations")
     parser.add_argument("--timeout", type=int, default=30, help="Timeout per run (seconds)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument(
+        "--attacker-count",
+        type=int,
+        default=None,
+        help="Number of attacker functions to generate (default: random 500-10000)",
+    )
     parser.add_argument("--flags", nargs="*", default=DEFAULT_FLAGS, help="Extra d8 flags")
     parser.add_argument(
         "--analyze-crashes",
@@ -227,7 +295,7 @@ def main() -> int:
     crashes = 0
     for i in range(args.iterations):
         case_id = f"case_{int(time.time())}_{i}_{rng.randint(1000,9999)}"
-        js_text, params = render_case(case_id, rng)
+        js_text, params = render_case(case_id, rng, args.attacker_count)
 
         js_path = out_dir / f"{case_id}.js"
         meta_path = out_dir / f"{case_id}.meta"
