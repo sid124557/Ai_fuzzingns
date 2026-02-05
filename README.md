@@ -33,6 +33,15 @@ python3 scripts/fuzz_v8.py --d8 /content/v8/<path-to-d8> --iterations 100 --anal
 python3 scripts/analyze_d8_log.py crashes/<case>.log --report crashes/<case>.report
 ```
 
+5. Generate a 10,000-file JS corpus with suggested flags:
+
+```bash
+python3 scripts/generate_js_corpus.py --out corpus --count 10000
+```
+
+Each generated JS file includes a header with `suggested_d8_flags` that you can
+copy into your `d8` invocation.
+
 ## Notes
 
 - If you want to target a different `d8` build, pass your own URL to
