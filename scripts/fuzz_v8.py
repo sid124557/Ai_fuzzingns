@@ -1,16 +1,71 @@
 #!/usr/bin/env python3
 import argparse
 import random
+import re
 import subprocess
 import time
 from pathlib import Path
 
 from scripts.analyze_d8_log import summarize_log
 
+MAGLEV_PATTERNS = {
+    "checkmaps": re.compile(r"CheckMaps"),
+    "checkbounds": re.compile(r"CheckBounds"),
+    "deopts": re.compile(r"deopt", re.IGNORECASE),
+    "inlining": re.compile(r"Inlined"),
+    "elements_transitions": re.compile(r"elements transition", re.IGNORECASE),
+}
+
 BASE_TEMPLATE = r"""
 // ============================================================================
 // V8 SEGFAULT FUZZ TEMPLATE
 // ============================================================================
+
+const ATTACKER_COUNT = {attacker_count};
+
+function makeAttackers(seed) {{
+  let attackers = new Array(ATTACKER_COUNT);
+  let x = seed | 0;
+  for (let i = 0; i < attackers.length; i++) {{
+    x = (x * 1103515245 + 12345) | 0;
+    let mode = x & 7;
+    attackers[i] = function attacker(slot, target) {{
+      switch (mode) {{
+        case 0:
+          target.length = (slot & 3) + 1;
+          return target[slot];
+        case 1: {{
+          let tmp = new Array(8);
+          tmp[0] = target;
+          tmp[1] = tmp;
+          return tmp[(slot ^ 1) & 7];
+        }}
+        case 2: {{
+          let t = new Uint8Array(64);
+          t[slot & 63] = slot & 255;
+          return t[slot & 63];
+        }}
+        case 3: {{
+          let map = new Map();
+          map.set("k", target);
+          map.set(slot, slot + 0.1);
+          return map.get("k");
+        }}
+        case 4:
+          delete target[slot & 3];
+          return target[slot & 3];
+        case 5:
+          target[slot & 1] = {ptr: slot, tag: "obj"};
+          return target[slot & 1];
+        case 6:
+          return Math.imul(slot, 1337) ^ (slot >>> 1);
+        default:
+          return (slot + 0.5) / (slot + 1);
+      }}
+    }};
+  }}
+  return attackers;
+}}
 
 function vulnerableRead(arr) {
   let len = arr.length;
@@ -37,6 +92,7 @@ for (let i = 0; i < 5; i++) {
 delete victim[2]; // HOLEY_DOUBLE_ELEMENTS
 
 let callCount = 0;
+let attackers = makeAttackers({seed});
 
 let proxy = new Proxy(victim, {
   get(target, prop, receiver) {
@@ -99,12 +155,23 @@ let exceptions = 0;
 for (let i = 0; i < {iterations}; i++) {
   try {
     let val = vulnerableRead(proxy);
+    let attacker = attackers[i % attackers.length];
+    let havoc = attacker(i, victim);
 
     if (val !== undefined && val !== null && typeof val === 'object') {
       try {
         Object.keys(val);
         val.toString();
         JSON.stringify(val);
+      } catch (innerE) {
+        // swallow
+      }
+    }
+
+    if (havoc && typeof havoc === 'object') {
+      try {
+        if (Array.isArray(havoc)) havoc.length = 1;
+        if (havoc && havoc.buffer) new Uint8Array(havoc.buffer);
       } catch (innerE) {
         // swallow
       }
@@ -169,12 +236,77 @@ def random_params(rng: random.Random) -> dict:
         "iterations": rng.randint(50, 400),
         "outer_gc_interval": rng.randint(1, 6),
         "spin": rng.randint(200, 2000),
+        "attacker_count": rng.randint(500, 10000),
+        "seed": rng.randint(1, 1_000_000),
     }
 
 
-def render_case(case_id: str, rng: random.Random) -> str:
+def scale_range(rng: random.Random, low: int, high: int, scale: float) -> int:
+    scaled_low = max(1, int(low * scale))
+    scaled_high = max(scaled_low + 1, int(high * scale))
+    return rng.randint(scaled_low, scaled_high)
+
+
+def apply_tuning(params: dict, rng: random.Random, tuning: dict[str, float]) -> dict:
+    tuned = dict(params)
+    tuned["spray_count"] = scale_range(
+        rng, 2000, 25000, tuning.get("spray_scale", 1.0)
+    )
+    tuned["attacker_count"] = scale_range(
+        rng, 500, 10000, tuning.get("attacker_scale", 1.0)
+    )
+    tuned["iterations"] = scale_range(
+        rng, 50, 400, tuning.get("iterations_scale", 1.0)
+    )
+    tuned["spin"] = scale_range(rng, 200, 2000, tuning.get("spin_scale", 1.0))
+    tuned["oob_offset"] = scale_range(
+        rng, 32, 300, tuning.get("oob_scale", 1.0)
+    )
+    return tuned
+
+
+def render_case(
+    case_id: str,
+    rng: random.Random,
+    attacker_count: int | None,
+    tuning: dict[str, float] | None,
+) -> str:
     params = random_params(rng)
+    if attacker_count is not None:
+        params["attacker_count"] = attacker_count
+    if tuning:
+        params = apply_tuning(params, rng, tuning)
     return BASE_TEMPLATE.format(**params), params
+
+
+def parse_maglev_output(output: str) -> dict[str, int]:
+    stats: dict[str, int] = {}
+    for key, pattern in MAGLEV_PATTERNS.items():
+        stats[key] = len(pattern.findall(output))
+    return stats
+
+
+def score_maglev(stats: dict[str, int]) -> int:
+    score = 0
+    score += max(0, 12 - stats["checkmaps"])
+    score += max(0, 12 - stats["checkbounds"])
+    score += stats["deopts"] * 3
+    score += stats["inlining"] * 4
+    score += stats["elements_transitions"] * 2
+    return score
+
+
+def update_tuning(tuning: dict[str, float], stats: dict[str, int]) -> dict[str, float]:
+    next_tuning = dict(tuning)
+    if stats["deopts"] < 2:
+        next_tuning["spray_scale"] = min(2.0, next_tuning["spray_scale"] + 0.1)
+        next_tuning["attacker_scale"] = min(2.0, next_tuning["attacker_scale"] + 0.1)
+    if stats["checkmaps"] > 8:
+        next_tuning["oob_scale"] = min(1.8, next_tuning["oob_scale"] + 0.1)
+    if stats["inlining"] == 0:
+        next_tuning["iterations_scale"] = min(1.8, next_tuning["iterations_scale"] + 0.1)
+        next_tuning["spin_scale"] = min(1.8, next_tuning["spin_scale"] + 0.1)
+    return next_tuning
 
 
 def run_case(d8_path: Path, js_path: Path, flags: list[str], timeout_s: int) -> tuple[int, str]:
@@ -203,6 +335,28 @@ def main() -> int:
     parser.add_argument("--iterations", type=int, default=50, help="Number of fuzz iterations")
     parser.add_argument("--timeout", type=int, default=30, help="Timeout per run (seconds)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument(
+        "--attacker-count",
+        type=int,
+        default=None,
+        help="Number of attacker functions to generate (default: random 500-10000)",
+    )
+    parser.add_argument(
+        "--maglev-guided",
+        action="store_true",
+        help="Use Maglev output stats to steer generation and keep interesting cases",
+    )
+    parser.add_argument(
+        "--maglev-threshold",
+        type=int,
+        default=18,
+        help="Minimum Maglev score to keep non-crashing cases when guided",
+    )
+    parser.add_argument(
+        "--keep-interesting",
+        action="store_true",
+        help="Keep non-crashing cases that meet the Maglev score threshold",
+    )
     parser.add_argument("--flags", nargs="*", default=DEFAULT_FLAGS, help="Extra d8 flags")
     parser.add_argument(
         "--analyze-crashes",
@@ -221,13 +375,25 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rng = random.Random(args.seed)
+    tuning = {
+        "spray_scale": 1.0,
+        "attacker_scale": 1.0,
+        "iterations_scale": 1.0,
+        "spin_scale": 1.0,
+        "oob_scale": 1.0,
+    }
 
     print(f"[+] Running {args.iterations} fuzz iterations")
 
     crashes = 0
     for i in range(args.iterations):
         case_id = f"case_{int(time.time())}_{i}_{rng.randint(1000,9999)}"
-        js_text, params = render_case(case_id, rng)
+        js_text, params = render_case(
+            case_id,
+            rng,
+            args.attacker_count,
+            tuning if args.maglev_guided else None,
+        )
 
         js_path = out_dir / f"{case_id}.js"
         meta_path = out_dir / f"{case_id}.meta"
@@ -244,14 +410,38 @@ def main() -> int:
 
         log_path.write_text(output)
 
+        maglev_stats = {}
+        maglev_score = 0
+        if args.maglev_guided:
+            maglev_stats = parse_maglev_output(output)
+            maglev_score = score_maglev(maglev_stats)
+            tuning = update_tuning(tuning, maglev_stats)
+            print(f"[MAGLEV] {case_id} score={maglev_score} stats={maglev_stats}")
+            meta_path.write_text(
+                meta_path.read_text()
+                + "\n"
+                + "\n".join([f"maglev_{k}={v}" for k, v in maglev_stats.items()])
+                + f"\nmaglev_score={maglev_score}\n"
+            )
+
         if is_crash(returncode, output):
             crashes += 1
             print(f"[CRASH] {case_id} returncode={returncode}")
         else:
-            # Clean up non-crashes to keep output concise
-            js_path.unlink(missing_ok=True)
-            meta_path.unlink(missing_ok=True)
-            log_path.unlink(missing_ok=True)
+            keep_interesting = (
+                args.maglev_guided
+                and args.keep_interesting
+                and maglev_score >= args.maglev_threshold
+            )
+            if keep_interesting:
+                print(
+                    f"[INTERESTING] {case_id} maglev_score={maglev_score} stats={maglev_stats}"
+                )
+            else:
+                # Clean up non-crashes to keep output concise
+                js_path.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+                log_path.unlink(missing_ok=True)
 
     if args.analyze_crashes and crashes:
         print("[+] Analyzing crash logs...")
