@@ -6,6 +6,7 @@ import subprocess
 import time
 import textwrap
 from pathlib import Path
+from collections import Counter, deque
 
 from scripts.analyze_d8_log import summarize_log
 
@@ -17,6 +18,17 @@ MAGLEV_PATTERNS = {
     "elements_transitions": re.compile(r"elements transition", re.IGNORECASE),
 }
 
+PATTERN_REGEXES = {
+    "checkmaps": re.compile(r"CheckMaps"),
+    "checkbounds": re.compile(r"CheckBounds"),
+    "deopt_lazy": re.compile(r"\blazy\b", re.IGNORECASE),
+    "deopt_eager": re.compile(r"\beager\b", re.IGNORECASE),
+    "inline": re.compile(r"Inlined"),
+    "elements_transition": re.compile(r"elements transition", re.IGNORECASE),
+    "allocation": re.compile(r"Allocate|NewSpace", re.IGNORECASE),
+    "bounds": re.compile(r"OutOfBounds|CheckBounds", re.IGNORECASE),
+}
+
 BASE_TEMPLATE = r"""
 // ============================================================================
 // V8 SEGFAULT FUZZ TEMPLATE
@@ -24,6 +36,10 @@ BASE_TEMPLATE = r"""
 
 const ATTACKER_COUNT = {attacker_count};
 const MUTATION_COUNT = {mutation_count};
+
+const ATTACKS = [
+{attacker_plan}
+];
 
 const MUTATIONS = [
 {mutation_plan}
@@ -34,41 +50,8 @@ function makeAttackers(seed) {{
   let x = seed | 0;
   for (let i = 0; i < attackers.length; i++) {{
     x = (x * 1103515245 + 12345) | 0;
-    let mode = x & 7;
-    attackers[i] = function attacker(slot, target) {{
-      switch (mode) {{
-        case 0:
-          target.length = (slot & 3) + 1;
-          return target[slot];
-        case 1: {{
-          let tmp = new Array(8);
-          tmp[0] = target;
-          tmp[1] = tmp;
-          return tmp[(slot ^ 1) & 7];
-        }}
-        case 2: {{
-          let t = new Uint8Array(64);
-          t[slot & 63] = slot & 255;
-          return t[slot & 63];
-        }}
-        case 3: {{
-          let map = new Map();
-          map.set("k", target);
-          map.set(slot, slot + 0.1);
-          return map.get("k");
-        }}
-        case 4:
-          delete target[slot & 3];
-          return target[slot & 3];
-        case 5:
-          target[slot & 1] = {ptr: slot, tag: "obj"};
-          return target[slot & 1];
-        case 6:
-          return Math.imul(slot, 1337) ^ (slot >>> 1);
-        default:
-          return (slot + 0.5) / (slot + 1);
-      }}
-    }};
+    let mode = (x >>> 0) % ATTACKS.length;
+    attackers[i] = ATTACKS[mode];
   }}
   return attackers;
 }}
@@ -235,6 +218,121 @@ CRASH_STRINGS = [
     "Fatal error",
 ]
 
+ATTACK_LIBRARY = [
+    {
+        "name": "length_flip",
+        "tag": "length",
+        "code": """
+target.length = (slot & 3) + 1;
+return target[slot];
+""",
+    },
+    {
+        "name": "self_ref_array",
+        "tag": "maps",
+        "code": """
+let tmp = new Array(8);
+tmp[0] = target;
+tmp[1] = tmp;
+return tmp[(slot ^ 1) & 7];
+""",
+    },
+    {
+        "name": "typed_store",
+        "tag": "typed",
+        "code": """
+let t = new Uint8Array(64);
+t[slot & 63] = slot & 255;
+return t[slot & 63];
+""",
+    },
+    {
+        "name": "map_lookup",
+        "tag": "maps",
+        "code": """
+let map = new Map();
+map.set("k", target);
+map.set(slot, slot + 0.1);
+return map.get("k");
+""",
+    },
+    {
+        "name": "holey_delete",
+        "tag": "holey",
+        "code": """
+delete target[slot & 3];
+return target[slot & 3];
+""",
+    },
+    {
+        "name": "object_write",
+        "tag": "maps",
+        "code": """
+target[slot & 1] = {ptr: slot, tag: "obj"};
+return target[slot & 1];
+""",
+    },
+    {
+        "name": "int_math",
+        "tag": "arith",
+        "code": """
+return Math.imul(slot, 1337) ^ (slot >>> 1);
+""",
+    },
+    {
+        "name": "float_math",
+        "tag": "arith",
+        "code": """
+return (slot + 0.5) / (slot + 1);
+""",
+    },
+    {
+        "name": "prototype_flip",
+        "tag": "maps",
+        "code": """
+Object.setPrototypeOf(target, (slot & 1) ? [] : {x: 1});
+return target.length;
+""",
+    },
+    {
+        "name": "length_proxy",
+        "tag": "proxy",
+        "code": """
+let p = new Proxy(target, {
+  get(t, prop, receiver) {
+    if (prop === "length") {
+      gc();
+    }
+    return Reflect.get(t, prop, receiver);
+  }
+});
+return p.length;
+""",
+    },
+    {
+        "name": "arraybuffer_view",
+        "tag": "typed",
+        "code": """
+let buf = new ArrayBuffer(64);
+let view = new Uint32Array(buf);
+view[slot & 15] = slot >>> 0;
+return view[slot & 15];
+""",
+    },
+    {
+        "name": "dense_fill",
+        "tag": "length",
+        "code": """
+for (let i = 0; i < 6; i++) {
+  target[i] = slot + i + 0.25;
+}
+return target[slot & 3];
+""",
+    },
+]
+
+ATTACK_TAGS = {attack["tag"] for attack in ATTACK_LIBRARY}
+
 MUTATION_LIBRARY = [
     {
         "name": "flip_to_object",
@@ -345,8 +443,9 @@ def random_params(rng: random.Random) -> dict:
         "iterations": rng.randint(50, 400),
         "outer_gc_interval": rng.randint(1, 6),
         "spin": rng.randint(200, 2000),
-        "attacker_count": rng.randint(500, 10000),
+        "attacker_count": rng.randint(1000, 10000),
         "seed": rng.randint(1, 1_000_000),
+        "attack_plan_size": rng.randint(12, 24),
         "mutation_count": rng.randint(6, 12),
     }
 
@@ -363,7 +462,7 @@ def apply_tuning(params: dict, rng: random.Random, tuning: dict[str, float]) -> 
         rng, 2000, 25000, tuning.get("spray_scale", 1.0)
     )
     tuned["attacker_count"] = scale_range(
-        rng, 500, 10000, tuning.get("attacker_scale", 1.0)
+        rng, 1000, 10000, tuning.get("attacker_scale", 1.0)
     )
     tuned["iterations"] = scale_range(
         rng, 50, 400, tuning.get("iterations_scale", 1.0)
@@ -373,6 +472,53 @@ def apply_tuning(params: dict, rng: random.Random, tuning: dict[str, float]) -> 
         rng, 32, 300, tuning.get("oob_scale", 1.0)
     )
     return tuned
+
+
+def init_attack_weights() -> dict[str, float]:
+    return {tag: 1.0 for tag in ATTACK_TAGS}
+
+
+def update_attack_weights(
+    weights: dict[str, float], stats: dict[str, int]
+) -> dict[str, float]:
+    next_weights = dict(weights)
+    if stats["deopts"] < 2:
+        for tag in ("proxy", "length", "holey"):
+            next_weights[tag] = min(2.0, next_weights[tag] + 0.2)
+    if stats["checkmaps"] > 8:
+        next_weights["maps"] = min(2.0, next_weights["maps"] + 0.2)
+    if stats["elements_transitions"] == 0:
+        next_weights["typed"] = min(2.0, next_weights["typed"] + 0.2)
+    if stats["checkbounds"] > 8:
+        next_weights["length"] = min(2.0, next_weights["length"] + 0.2)
+    return next_weights
+
+
+def build_attack_plan(
+    rng: random.Random,
+    attack_count: int,
+    attack_weights: dict[str, float],
+) -> tuple[str, list[str]]:
+    weighted_ops: list[tuple[dict[str, str], float]] = []
+    for attack in ATTACK_LIBRARY:
+        weight = attack_weights.get(attack["tag"], 1.0)
+        weighted_ops.append((attack, weight))
+
+    selections: list[dict[str, str]] = []
+    for _ in range(attack_count):
+        choices = [op for op, _ in weighted_ops]
+        weights = [w for _, w in weighted_ops]
+        selections.append(rng.choices(choices, weights=weights, k=1)[0])
+
+    rendered = []
+    for attack in selections:
+        code = textwrap.dedent(attack["code"]).strip()
+        rendered.append(
+            "  function(slot, target) {\n"
+            + textwrap.indent(code, " " * 4)
+            + "\n  }"
+        )
+    return ",\n".join(rendered), [attack["name"] for attack in selections]
 
 
 def init_mutation_weights() -> dict[str, float]:
@@ -427,12 +573,21 @@ def render_case(
     rng: random.Random,
     attacker_count: int | None,
     tuning: dict[str, float] | None,
-) -> tuple[str, dict, list[str]]:
+) -> tuple[str, dict, list[str], list[str]]:
     params = random_params(rng)
     if attacker_count is not None:
         params["attacker_count"] = attacker_count
     if tuning:
         params = apply_tuning(params, rng, tuning)
+    attack_weights = (
+        tuning["attack_weights"]
+        if tuning and "attack_weights" in tuning
+        else init_attack_weights()
+    )
+    attack_plan, attack_names = build_attack_plan(
+        rng, params["attack_plan_size"], attack_weights
+    )
+    params["attacker_plan"] = attack_plan
     mutation_weights = (
         tuning["mutation_weights"]
         if tuning and "mutation_weights" in tuning
@@ -442,7 +597,7 @@ def render_case(
         rng, params["mutation_count"], mutation_weights
     )
     params["mutation_plan"] = mutation_plan
-    return BASE_TEMPLATE.format(**params), params, mutation_names
+    return BASE_TEMPLATE.format(**params), params, attack_names, mutation_names
 
 
 def parse_maglev_output(output: str) -> dict[str, int]:
@@ -450,6 +605,13 @@ def parse_maglev_output(output: str) -> dict[str, int]:
     for key, pattern in MAGLEV_PATTERNS.items():
         stats[key] = len(pattern.findall(output))
     return stats
+
+
+def detect_patterns(output: str) -> Counter:
+    patterns = Counter()
+    for key, pattern in PATTERN_REGEXES.items():
+        patterns[key] = len(pattern.findall(output))
+    return patterns
 
 
 def score_maglev(stats: dict[str, int]) -> int:
@@ -472,39 +634,62 @@ def update_tuning(tuning: dict[str, float], stats: dict[str, int]) -> dict[str, 
     if stats["inlining"] == 0:
         next_tuning["iterations_scale"] = min(1.8, next_tuning["iterations_scale"] + 0.1)
         next_tuning["spin_scale"] = min(1.8, next_tuning["spin_scale"] + 0.1)
+    next_tuning["attack_weights"] = update_attack_weights(
+        next_tuning.get("attack_weights", init_attack_weights()), stats
+    )
     next_tuning["mutation_weights"] = update_mutation_weights(
         next_tuning.get("mutation_weights", init_mutation_weights()), stats
     )
     return next_tuning
 
 
-def parse_maglev_output(output: str) -> dict[str, int]:
-    stats: dict[str, int] = {}
-    for key, pattern in MAGLEV_PATTERNS.items():
-        stats[key] = len(pattern.findall(output))
-    return stats
+def update_tuning_from_history(
+    tuning: dict[str, float],
+    history: deque[dict[str, int]],
+    pattern_history: deque[Counter],
+) -> dict[str, float]:
+    if not history:
+        return tuning
+    avg = Counter()
+    for entry in history:
+        avg.update(entry)
+    for key in list(avg.keys()):
+        avg[key] = avg[key] / len(history)
 
+    pattern_avg = Counter()
+    for entry in pattern_history:
+        pattern_avg.update(entry)
+    for key in list(pattern_avg.keys()):
+        pattern_avg[key] = pattern_avg[key] / len(pattern_history)
 
-def score_maglev(stats: dict[str, int]) -> int:
-    score = 0
-    score += max(0, 12 - stats["checkmaps"])
-    score += max(0, 12 - stats["checkbounds"])
-    score += stats["deopts"] * 3
-    score += stats["inlining"] * 4
-    score += stats["elements_transitions"] * 2
-    return score
-
-
-def update_tuning(tuning: dict[str, float], stats: dict[str, int]) -> dict[str, float]:
     next_tuning = dict(tuning)
-    if stats["deopts"] < 2:
+    if avg["checkmaps"] > 10:
+        next_tuning["attack_weights"]["maps"] = min(
+            2.0, next_tuning["attack_weights"]["maps"] + 0.1
+        )
+    if avg["checkbounds"] > 10 or pattern_avg["bounds"] > 4:
+        next_tuning["attack_weights"]["length"] = min(
+            2.0, next_tuning["attack_weights"]["length"] + 0.1
+        )
+        next_tuning["mutation_weights"]["length"] = min(
+            2.0, next_tuning["mutation_weights"]["length"] + 0.1
+        )
+    if avg["deopts"] < 2 and pattern_avg["deopt_lazy"] < 1:
+        next_tuning["attack_weights"]["proxy"] = min(
+            2.0, next_tuning["attack_weights"]["proxy"] + 0.1
+        )
+        next_tuning["mutation_weights"]["proxy"] = min(
+            2.0, next_tuning["mutation_weights"]["proxy"] + 0.1
+        )
+    if avg["elements_transitions"] == 0 and pattern_avg["elements_transition"] == 0:
+        next_tuning["attack_weights"]["typed"] = min(
+            2.0, next_tuning["attack_weights"]["typed"] + 0.1
+        )
+        next_tuning["mutation_weights"]["typed"] = min(
+            2.0, next_tuning["mutation_weights"]["typed"] + 0.1
+        )
+    if pattern_avg["allocation"] > 5:
         next_tuning["spray_scale"] = min(2.0, next_tuning["spray_scale"] + 0.1)
-        next_tuning["attacker_scale"] = min(2.0, next_tuning["attacker_scale"] + 0.1)
-    if stats["checkmaps"] > 8:
-        next_tuning["oob_scale"] = min(1.8, next_tuning["oob_scale"] + 0.1)
-    if stats["inlining"] == 0:
-        next_tuning["iterations_scale"] = min(1.8, next_tuning["iterations_scale"] + 0.1)
-        next_tuning["spin_scale"] = min(1.8, next_tuning["spin_scale"] + 0.1)
     return next_tuning
 
 
@@ -538,7 +723,7 @@ def main() -> int:
         "--attacker-count",
         type=int,
         default=None,
-        help="Number of attacker functions to generate (default: random 500-10000)",
+        help="Number of attacker functions to generate (default: random 1000-10000)",
     )
     parser.add_argument(
         "--maglev-guided",
@@ -580,15 +765,18 @@ def main() -> int:
         "iterations_scale": 1.0,
         "spin_scale": 1.0,
         "oob_scale": 1.0,
+        "attack_weights": init_attack_weights(),
         "mutation_weights": init_mutation_weights(),
     }
+    maglev_history: deque[dict[str, int]] = deque(maxlen=6)
+    pattern_history: deque[Counter] = deque(maxlen=6)
 
     print(f"[+] Running {args.iterations} fuzz iterations")
 
     crashes = 0
     for i in range(args.iterations):
         case_id = f"case_{int(time.time())}_{i}_{rng.randint(1000,9999)}"
-        js_text, params, mutation_names = render_case(
+        js_text, params, attack_names, mutation_names = render_case(
             case_id,
             rng,
             args.attacker_count,
@@ -602,7 +790,9 @@ def main() -> int:
         js_path.write_text(js_text)
         meta_path.write_text("\n".join([f"{k}={v}" for k, v in params.items()]))
         meta_path.write_text(
-            meta_path.read_text() + f"\nmutations={','.join(mutation_names)}\n"
+            meta_path.read_text()
+            + f"\nattacks={','.join(attack_names)}\n"
+            + f"mutations={','.join(mutation_names)}\n"
         )
 
         try:
@@ -615,16 +805,23 @@ def main() -> int:
 
         maglev_stats = {}
         maglev_score = 0
+        pattern_stats = Counter()
         if args.maglev_guided:
             maglev_stats = parse_maglev_output(output)
             maglev_score = score_maglev(maglev_stats)
             tuning = update_tuning(tuning, maglev_stats)
+            pattern_stats = detect_patterns(output)
+            maglev_history.append(maglev_stats)
+            pattern_history.append(pattern_stats)
+            tuning = update_tuning_from_history(tuning, maglev_history, pattern_history)
             print(f"[MAGLEV] {case_id} score={maglev_score} stats={maglev_stats}")
             meta_path.write_text(
                 meta_path.read_text()
                 + "\n"
                 + "\n".join([f"maglev_{k}={v}" for k, v in maglev_stats.items()])
                 + f"\nmaglev_score={maglev_score}\n"
+                + "\n".join([f"pattern_{k}={v}" for k, v in pattern_stats.items()])
+                + "\n"
             )
 
         if is_crash(returncode, output):
