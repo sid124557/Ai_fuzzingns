@@ -2,7 +2,7 @@
 set -euxo pipefail
 
 V8_DIR=${1:-"/content/v8"}
-URL=${2:-"https://www.googleapis.com/download/storage/v1/b/v8-asan/o/linux-debug%2Fd8-arm-asan-linux-debug-v8-component-104921.zip?generation=1769492873781841&alt=media"}
+URL=${2:-"https://www.googleapis.com/download/storage/v1/b/v8-asan/o/linux-debug%2Fd8-arm-asan-linux-debug-v8-component-105103.zip?generation=1770313642314492&alt=media"}
 
 mkdir -p "$V8_DIR"
 cd "$V8_DIR"
