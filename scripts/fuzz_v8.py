@@ -628,6 +628,17 @@ def detect_coverage(output: str) -> dict[str, int]:
     return {"blocks": len(blocks), "ops": len(ops)}
 
 
+def compute_deviation_score(
+    current: dict[str, int], baseline: dict[str, float]
+) -> float:
+    score = 0.0
+    for key, base_value in baseline.items():
+        current_value = current.get(key, 0)
+        delta = current_value - base_value
+        score += abs(delta)
+    return score
+
+
 def score_maglev(stats: dict[str, int]) -> int:
     score = 0
     score += max(0, 12 - stats["checkmaps"])
@@ -715,6 +726,10 @@ def update_tuning_from_history(
         next_tuning["attack_plan_scale"] = min(
             1.6, next_tuning.get("attack_plan_scale", 1.0) + 0.1
         )
+    if coverage_avg["ops"] < 10:
+        next_tuning["iterations_scale"] = min(
+            1.8, next_tuning.get("iterations_scale", 1.0) + 0.1
+        )
     return next_tuning
 
 
@@ -766,6 +781,12 @@ def main() -> int:
         action="store_true",
         help="Keep non-crashing cases that meet the Maglev score threshold",
     )
+    parser.add_argument(
+        "--baseline-runs",
+        type=int,
+        default=5,
+        help="Number of initial runs to learn baseline patterns before targeting deviations",
+    )
     parser.add_argument("--flags", nargs="*", default=DEFAULT_FLAGS, help="Extra d8 flags")
     parser.add_argument(
         "--analyze-crashes",
@@ -797,6 +818,9 @@ def main() -> int:
     maglev_history: deque[dict[str, int]] = deque(maxlen=6)
     pattern_history: deque[Counter] = deque(maxlen=6)
     coverage_history: deque[dict[str, int]] = deque(maxlen=6)
+    baseline_patterns: list[Counter] = []
+    baseline_coverages: list[dict[str, int]] = []
+    baseline_stats: list[dict[str, int]] = []
 
     print(f"[+] Running {args.iterations} fuzz iterations")
 
@@ -830,23 +854,59 @@ def main() -> int:
 
         log_path.write_text(output)
 
+        if i == 0 or (i + 1) % max(1, args.iterations // 10) == 0:
+            print(
+                f"[PROGRESS] {i + 1}/{args.iterations} "
+                f"latest=case:{case_id} returncode={returncode}"
+            )
+
         maglev_stats = {}
         maglev_score = 0
         pattern_stats = Counter()
         coverage_stats = {}
+        deviation_score = 0.0
         if args.maglev_guided:
             maglev_stats = parse_maglev_output(output)
             maglev_score = score_maglev(maglev_stats)
             tuning = update_tuning(tuning, maglev_stats)
             pattern_stats = detect_patterns(output)
             coverage_stats = detect_coverage(output)
+            if len(baseline_patterns) < args.baseline_runs:
+                baseline_patterns.append(pattern_stats)
+                baseline_coverages.append(coverage_stats)
+                baseline_stats.append(maglev_stats)
+            else:
+                baseline_pattern_avg = Counter()
+                for entry in baseline_patterns:
+                    baseline_pattern_avg.update(entry)
+                for key in list(baseline_pattern_avg.keys()):
+                    baseline_pattern_avg[key] = (
+                        baseline_pattern_avg[key] / len(baseline_patterns)
+                    )
+                baseline_coverage_avg = Counter()
+                for entry in baseline_coverages:
+                    baseline_coverage_avg.update(entry)
+                for key in list(baseline_coverage_avg.keys()):
+                    baseline_coverage_avg[key] = (
+                        baseline_coverage_avg[key] / len(baseline_coverages)
+                    )
+                combined_current = dict(pattern_stats)
+                combined_current.update(coverage_stats)
+                combined_baseline = dict(baseline_pattern_avg)
+                combined_baseline.update(baseline_coverage_avg)
+                deviation_score = compute_deviation_score(
+                    combined_current, combined_baseline
+                )
             maglev_history.append(maglev_stats)
             pattern_history.append(pattern_stats)
             coverage_history.append(coverage_stats)
             tuning = update_tuning_from_history(
                 tuning, maglev_history, pattern_history, coverage_history
             )
-            print(f"[MAGLEV] {case_id} score={maglev_score} stats={maglev_stats}")
+            print(
+                f"[MAGLEV] {case_id} score={maglev_score} deviation={deviation_score:.2f} "
+                f"stats={maglev_stats} coverage={coverage_stats}"
+            )
             meta_path.write_text(
                 meta_path.read_text()
                 + "\n"
@@ -857,7 +917,7 @@ def main() -> int:
                 + "\n".join(
                     [f"coverage_{k}={v}" for k, v in coverage_stats.items()]
                 )
-                + "\n"
+                + f"\ndeviation_score={deviation_score:.2f}\n"
             )
 
         if is_crash(returncode, output):
