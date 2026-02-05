@@ -478,6 +478,36 @@ def update_tuning(tuning: dict[str, float], stats: dict[str, int]) -> dict[str, 
     return next_tuning
 
 
+def parse_maglev_output(output: str) -> dict[str, int]:
+    stats: dict[str, int] = {}
+    for key, pattern in MAGLEV_PATTERNS.items():
+        stats[key] = len(pattern.findall(output))
+    return stats
+
+
+def score_maglev(stats: dict[str, int]) -> int:
+    score = 0
+    score += max(0, 12 - stats["checkmaps"])
+    score += max(0, 12 - stats["checkbounds"])
+    score += stats["deopts"] * 3
+    score += stats["inlining"] * 4
+    score += stats["elements_transitions"] * 2
+    return score
+
+
+def update_tuning(tuning: dict[str, float], stats: dict[str, int]) -> dict[str, float]:
+    next_tuning = dict(tuning)
+    if stats["deopts"] < 2:
+        next_tuning["spray_scale"] = min(2.0, next_tuning["spray_scale"] + 0.1)
+        next_tuning["attacker_scale"] = min(2.0, next_tuning["attacker_scale"] + 0.1)
+    if stats["checkmaps"] > 8:
+        next_tuning["oob_scale"] = min(1.8, next_tuning["oob_scale"] + 0.1)
+    if stats["inlining"] == 0:
+        next_tuning["iterations_scale"] = min(1.8, next_tuning["iterations_scale"] + 0.1)
+        next_tuning["spin_scale"] = min(1.8, next_tuning["spin_scale"] + 0.1)
+    return next_tuning
+
+
 def run_case(d8_path: Path, js_path: Path, flags: list[str], timeout_s: int) -> tuple[int, str]:
     cmd = [str(d8_path), *flags, str(js_path)]
     proc = subprocess.run(
