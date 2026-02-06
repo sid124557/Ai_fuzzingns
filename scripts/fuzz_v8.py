@@ -4,11 +4,25 @@ import random
 import re
 import subprocess
 import time
-import textwrap
+from collections import Counter, deque
 from pathlib import Path
 from collections import Counter, deque
 
 from scripts.analyze_d8_log import summarize_log
+from scripts.fuzzing.plans import (
+    build_attack_plan,
+    build_mutation_plan,
+    init_attack_weights,
+    init_mutation_weights,
+    update_attack_weights,
+    update_mutation_weights,
+)
+from scripts.fuzzing.signals import (
+    compute_deviation_score,
+    detect_coverage,
+    detect_patterns,
+    parse_maglev_output,
+)
 
 MAGLEV_PATTERNS = {
     "checkmaps": re.compile(r"CheckMaps"),
@@ -482,100 +496,6 @@ def apply_tuning(params: dict, rng: random.Random, tuning: dict[str, float]) -> 
     return tuned
 
 
-def init_attack_weights() -> dict[str, float]:
-    return {tag: 1.0 for tag in ATTACK_TAGS}
-
-
-def update_attack_weights(
-    weights: dict[str, float], stats: dict[str, int]
-) -> dict[str, float]:
-    next_weights = dict(weights)
-    if stats["deopts"] < 2:
-        for tag in ("proxy", "length", "holey"):
-            next_weights[tag] = min(2.0, next_weights[tag] + 0.2)
-    if stats["checkmaps"] > 8:
-        next_weights["maps"] = min(2.0, next_weights["maps"] + 0.2)
-    if stats["elements_transitions"] == 0:
-        next_weights["typed"] = min(2.0, next_weights["typed"] + 0.2)
-    if stats["checkbounds"] > 8:
-        next_weights["length"] = min(2.0, next_weights["length"] + 0.2)
-    return next_weights
-
-
-def build_attack_plan(
-    rng: random.Random,
-    attack_count: int,
-    attack_weights: dict[str, float],
-) -> tuple[str, list[str]]:
-    weighted_ops: list[tuple[dict[str, str], float]] = []
-    for attack in ATTACK_LIBRARY:
-        weight = attack_weights.get(attack["tag"], 1.0)
-        weighted_ops.append((attack, weight))
-
-    selections: list[dict[str, str]] = []
-    for _ in range(attack_count):
-        choices = [op for op, _ in weighted_ops]
-        weights = [w for _, w in weighted_ops]
-        selections.append(rng.choices(choices, weights=weights, k=1)[0])
-
-    rendered = []
-    for attack in selections:
-        code = textwrap.dedent(attack["code"]).strip()
-        rendered.append(
-            "  function(slot, target) {\n"
-            + textwrap.indent(code, " " * 4)
-            + "\n  }"
-        )
-    return ",\n".join(rendered), [attack["name"] for attack in selections]
-
-
-def init_mutation_weights() -> dict[str, float]:
-    return {tag: 1.0 for tag in MUTATION_TAGS}
-
-
-def update_mutation_weights(
-    weights: dict[str, float], stats: dict[str, int]
-) -> dict[str, float]:
-    next_weights = dict(weights)
-    if stats["deopts"] < 2:
-        for tag in ("proxy", "length", "holey"):
-            next_weights[tag] = min(2.0, next_weights[tag] + 0.2)
-    if stats["checkmaps"] > 8:
-        next_weights["maps"] = min(2.0, next_weights["maps"] + 0.2)
-    if stats["elements_transitions"] == 0:
-        next_weights["typed"] = min(2.0, next_weights["typed"] + 0.2)
-    if stats["checkbounds"] > 8:
-        next_weights["length"] = min(2.0, next_weights["length"] + 0.2)
-    return next_weights
-
-
-def build_mutation_plan(
-    rng: random.Random,
-    mutation_count: int,
-    mutation_weights: dict[str, float],
-) -> tuple[str, list[str]]:
-    weighted_ops: list[tuple[dict[str, str], float]] = []
-    for mutation in MUTATION_LIBRARY:
-        weight = mutation_weights.get(mutation["tag"], 1.0)
-        weighted_ops.append((mutation, weight))
-
-    selections: list[dict[str, str]] = []
-    for _ in range(mutation_count):
-        choices = [op for op, _ in weighted_ops]
-        weights = [w for _, w in weighted_ops]
-        selections.append(rng.choices(choices, weights=weights, k=1)[0])
-
-    rendered = []
-    for mutation in selections:
-        code = textwrap.dedent(mutation["code"]).strip()
-        rendered.append(
-            "  function(target, i) {\n"
-            + textwrap.indent(code, " " * 4)
-            + "\n  }"
-        )
-    return ",\n".join(rendered), [mutation["name"] for mutation in selections]
-
-
 def render_case(
     case_id: str,
     rng: random.Random,
@@ -606,37 +526,6 @@ def render_case(
     )
     params["mutation_plan"] = mutation_plan
     return BASE_TEMPLATE.format(**params), params, attack_names, mutation_names
-
-
-def parse_maglev_output(output: str) -> dict[str, int]:
-    stats: dict[str, int] = {}
-    for key, pattern in MAGLEV_PATTERNS.items():
-        stats[key] = len(pattern.findall(output))
-    return stats
-
-
-def detect_patterns(output: str) -> Counter:
-    patterns = Counter()
-    for key, pattern in PATTERN_REGEXES.items():
-        patterns[key] = len(pattern.findall(output))
-    return patterns
-
-
-def detect_coverage(output: str) -> dict[str, int]:
-    blocks = set(COVERAGE_REGEXES["blocks"].findall(output))
-    ops = set(COVERAGE_REGEXES["ops"].findall(output))
-    return {"blocks": len(blocks), "ops": len(ops)}
-
-
-def compute_deviation_score(
-    current: dict[str, int], baseline: dict[str, float]
-) -> float:
-    score = 0.0
-    for key, base_value in baseline.items():
-        current_value = current.get(key, 0)
-        delta = current_value - base_value
-        score += abs(delta)
-    return score
 
 
 def score_maglev(stats: dict[str, int]) -> int:
