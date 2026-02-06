@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import random
 import re
 import subprocess
@@ -23,30 +24,6 @@ from scripts.fuzzing.signals import (
     detect_patterns,
     parse_maglev_output,
 )
-
-MAGLEV_PATTERNS = {
-    "checkmaps": re.compile(r"CheckMaps"),
-    "checkbounds": re.compile(r"CheckBounds"),
-    "deopts": re.compile(r"deopt", re.IGNORECASE),
-    "inlining": re.compile(r"Inlined"),
-    "elements_transitions": re.compile(r"elements transition", re.IGNORECASE),
-}
-
-PATTERN_REGEXES = {
-    "checkmaps": re.compile(r"CheckMaps"),
-    "checkbounds": re.compile(r"CheckBounds"),
-    "deopt_lazy": re.compile(r"\blazy\b", re.IGNORECASE),
-    "deopt_eager": re.compile(r"\beager\b", re.IGNORECASE),
-    "inline": re.compile(r"Inlined"),
-    "elements_transition": re.compile(r"elements transition", re.IGNORECASE),
-    "allocation": re.compile(r"Allocate|NewSpace", re.IGNORECASE),
-    "bounds": re.compile(r"OutOfBounds|CheckBounds", re.IGNORECASE),
-}
-
-COVERAGE_REGEXES = {
-    "blocks": re.compile(r"\bBlock\s+(b\d+)\b"),
-    "ops": re.compile(r"\b(CheckMaps|CheckBounds|Load\w+|Store\w+|Call\w+)\b"),
-}
 
 BASE_TEMPLATE = r"""
 // ============================================================================
@@ -676,6 +653,11 @@ def main() -> int:
         default=5,
         help="Number of initial runs to learn baseline patterns before targeting deviations",
     )
+    parser.add_argument(
+        "--status-file",
+        default="crashes/status.json",
+        help="Path to write run status for dashboards",
+    )
     parser.add_argument("--flags", nargs="*", default=DEFAULT_FLAGS, help="Extra d8 flags")
     parser.add_argument(
         "--analyze-crashes",
@@ -692,6 +674,8 @@ def main() -> int:
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    status_path = Path(args.status_file)
+    status_path.parent.mkdir(parents=True, exist_ok=True)
 
     rng = random.Random(args.seed)
     tuning = {
@@ -743,6 +727,13 @@ def main() -> int:
 
         log_path.write_text(output)
 
+        status_payload = {
+            "iteration": i + 1,
+            "iterations_total": args.iterations,
+            "case_id": case_id,
+            "returncode": returncode,
+            "timestamp": int(time.time()),
+        }
         if i == 0 or (i + 1) % max(1, args.iterations // 10) == 0:
             print(
                 f"[PROGRESS] {i + 1}/{args.iterations} "
@@ -796,6 +787,15 @@ def main() -> int:
                 f"[MAGLEV] {case_id} score={maglev_score} deviation={deviation_score:.2f} "
                 f"stats={maglev_stats} coverage={coverage_stats}"
             )
+            status_payload.update(
+                {
+                    "maglev_score": maglev_score,
+                    "deviation_score": deviation_score,
+                    "maglev_stats": maglev_stats,
+                    "pattern_stats": dict(pattern_stats),
+                    "coverage_stats": coverage_stats,
+                }
+            )
             meta_path.write_text(
                 meta_path.read_text()
                 + "\n"
@@ -808,6 +808,8 @@ def main() -> int:
                 )
                 + f"\ndeviation_score={deviation_score:.2f}\n"
             )
+
+        status_path.write_text(json.dumps(status_payload, indent=2))
 
         if is_crash(returncode, output):
             crashes += 1
