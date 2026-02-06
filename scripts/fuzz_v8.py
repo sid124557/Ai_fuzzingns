@@ -3,14 +3,51 @@ import argparse
 import random
 import subprocess
 import time
+from collections import Counter, deque
 from pathlib import Path
 
 from scripts.analyze_d8_log import summarize_log
+from scripts.fuzzing.plans import (
+    build_attack_plan,
+    build_mutation_plan,
+    init_attack_weights,
+    init_mutation_weights,
+    update_attack_weights,
+    update_mutation_weights,
+)
+from scripts.fuzzing.signals import (
+    compute_deviation_score,
+    detect_coverage,
+    detect_patterns,
+    parse_maglev_output,
+)
 
 BASE_TEMPLATE = r"""
 // ============================================================================
 // V8 SEGFAULT FUZZ TEMPLATE
 // ============================================================================
+
+const ATTACKER_COUNT = {attacker_count};
+const MUTATION_COUNT = {mutation_count};
+
+const ATTACKS = [
+{attacker_plan}
+];
+
+const MUTATIONS = [
+{mutation_plan}
+];
+
+function makeAttackers(seed) {{
+  let attackers = new Array(ATTACKER_COUNT);
+  let x = seed | 0;
+  for (let i = 0; i < attackers.length; i++) {{
+    x = (x * 1103515245 + 12345) | 0;
+    let mode = (x >>> 0) % ATTACKS.length;
+    attackers[i] = ATTACKS[mode];
+  }}
+  return attackers;
+}}
 
 function vulnerableRead(arr) {
   let len = arr.length;
@@ -37,6 +74,7 @@ for (let i = 0; i < 5; i++) {
 delete victim[2]; // HOLEY_DOUBLE_ELEMENTS
 
 let callCount = 0;
+let attackers = makeAttackers({seed});
 
 let proxy = new Proxy(victim, {
   get(target, prop, receiver) {
@@ -96,15 +134,37 @@ let proxy = new Proxy(victim, {
 let successfulReads = 0;
 let exceptions = 0;
 
+function applyMutations(target, i) {
+  for (let j = 0; j < MUTATIONS.length; j++) {
+    try {
+      MUTATIONS[j](target, i);
+    } catch (e) {
+      // swallow
+    }
+  }
+}
+
 for (let i = 0; i < {iterations}; i++) {
   try {
     let val = vulnerableRead(proxy);
+    let attacker = attackers[i % attackers.length];
+    let havoc = attacker(i, victim);
+    applyMutations(victim, i);
 
     if (val !== undefined && val !== null && typeof val === 'object') {
       try {
         Object.keys(val);
         val.toString();
         JSON.stringify(val);
+      } catch (innerE) {
+        // swallow
+      }
+    }
+
+    if (havoc && typeof havoc === 'object') {
+      try {
+        if (Array.isArray(havoc)) havoc.length = 1;
+        if (havoc && havoc.buffer) new Uint8Array(havoc.buffer);
       } catch (innerE) {
         // swallow
       }
@@ -169,12 +229,164 @@ def random_params(rng: random.Random) -> dict:
         "iterations": rng.randint(50, 400),
         "outer_gc_interval": rng.randint(1, 6),
         "spin": rng.randint(200, 2000),
+        "attacker_count": rng.randint(1000, 10000),
+        "seed": rng.randint(1, 1_000_000),
+        "attack_plan_size": rng.randint(5000, 8000),
+        "mutation_count": rng.randint(6, 12),
     }
 
 
-def render_case(case_id: str, rng: random.Random) -> str:
+def scale_range(rng: random.Random, low: int, high: int, scale: float) -> int:
+    scaled_low = max(1, int(low * scale))
+    scaled_high = max(scaled_low + 1, int(high * scale))
+    return rng.randint(scaled_low, scaled_high)
+
+
+def apply_tuning(params: dict, rng: random.Random, tuning: dict[str, float]) -> dict:
+    tuned = dict(params)
+    tuned["spray_count"] = scale_range(
+        rng, 2000, 25000, tuning.get("spray_scale", 1.0)
+    )
+    tuned["attacker_count"] = scale_range(
+        rng, 1000, 10000, tuning.get("attacker_scale", 1.0)
+    )
+    tuned["attack_plan_size"] = scale_range(
+        rng, 5000, 8000, tuning.get("attack_plan_scale", 1.0)
+    )
+    tuned["iterations"] = scale_range(
+        rng, 50, 400, tuning.get("iterations_scale", 1.0)
+    )
+    tuned["spin"] = scale_range(rng, 200, 2000, tuning.get("spin_scale", 1.0))
+    tuned["oob_offset"] = scale_range(
+        rng, 32, 300, tuning.get("oob_scale", 1.0)
+    )
+    return tuned
+
+
+def render_case(
+    case_id: str,
+    rng: random.Random,
+    attacker_count: int | None,
+    tuning: dict[str, float] | None,
+) -> tuple[str, dict, list[str], list[str]]:
     params = random_params(rng)
-    return BASE_TEMPLATE.format(**params), params
+    if attacker_count is not None:
+        params["attacker_count"] = attacker_count
+    if tuning:
+        params = apply_tuning(params, rng, tuning)
+    attack_weights = (
+        tuning["attack_weights"]
+        if tuning and "attack_weights" in tuning
+        else init_attack_weights()
+    )
+    attack_plan, attack_names = build_attack_plan(
+        rng, params["attack_plan_size"], attack_weights
+    )
+    params["attacker_plan"] = attack_plan
+    mutation_weights = (
+        tuning["mutation_weights"]
+        if tuning and "mutation_weights" in tuning
+        else init_mutation_weights()
+    )
+    mutation_plan, mutation_names = build_mutation_plan(
+        rng, params["mutation_count"], mutation_weights
+    )
+    params["mutation_plan"] = mutation_plan
+    return BASE_TEMPLATE.format(**params), params, attack_names, mutation_names
+
+
+def score_maglev(stats: dict[str, int]) -> int:
+    score = 0
+    score += max(0, 12 - stats["checkmaps"])
+    score += max(0, 12 - stats["checkbounds"])
+    score += stats["deopts"] * 3
+    score += stats["inlining"] * 4
+    score += stats["elements_transitions"] * 2
+    return score
+
+
+def update_tuning(tuning: dict[str, float], stats: dict[str, int]) -> dict[str, float]:
+    next_tuning = dict(tuning)
+    if stats["deopts"] < 2:
+        next_tuning["spray_scale"] = min(2.0, next_tuning["spray_scale"] + 0.1)
+        next_tuning["attacker_scale"] = min(2.0, next_tuning["attacker_scale"] + 0.1)
+    if stats["checkmaps"] > 8:
+        next_tuning["oob_scale"] = min(1.8, next_tuning["oob_scale"] + 0.1)
+    if stats["inlining"] == 0:
+        next_tuning["iterations_scale"] = min(1.8, next_tuning["iterations_scale"] + 0.1)
+        next_tuning["spin_scale"] = min(1.8, next_tuning["spin_scale"] + 0.1)
+    next_tuning["attack_weights"] = update_attack_weights(
+        next_tuning.get("attack_weights", init_attack_weights()), stats
+    )
+    next_tuning["mutation_weights"] = update_mutation_weights(
+        next_tuning.get("mutation_weights", init_mutation_weights()), stats
+    )
+    return next_tuning
+
+
+def update_tuning_from_history(
+    tuning: dict[str, float],
+    history: deque[dict[str, int]],
+    pattern_history: deque[Counter],
+    coverage_history: deque[dict[str, int]],
+) -> dict[str, float]:
+    if not history:
+        return tuning
+    avg = Counter()
+    for entry in history:
+        avg.update(entry)
+    for key in list(avg.keys()):
+        avg[key] = avg[key] / len(history)
+
+    pattern_avg = Counter()
+    for entry in pattern_history:
+        pattern_avg.update(entry)
+    for key in list(pattern_avg.keys()):
+        pattern_avg[key] = pattern_avg[key] / len(pattern_history)
+
+    coverage_avg = Counter()
+    for entry in coverage_history:
+        coverage_avg.update(entry)
+    for key in list(coverage_avg.keys()):
+        coverage_avg[key] = coverage_avg[key] / len(coverage_history)
+
+    next_tuning = dict(tuning)
+    if avg["checkmaps"] > 10:
+        next_tuning["attack_weights"]["maps"] = min(
+            2.0, next_tuning["attack_weights"]["maps"] + 0.1
+        )
+    if avg["checkbounds"] > 10 or pattern_avg["bounds"] > 4:
+        next_tuning["attack_weights"]["length"] = min(
+            2.0, next_tuning["attack_weights"]["length"] + 0.1
+        )
+        next_tuning["mutation_weights"]["length"] = min(
+            2.0, next_tuning["mutation_weights"]["length"] + 0.1
+        )
+    if avg["deopts"] < 2 and pattern_avg["deopt_lazy"] < 1:
+        next_tuning["attack_weights"]["proxy"] = min(
+            2.0, next_tuning["attack_weights"]["proxy"] + 0.1
+        )
+        next_tuning["mutation_weights"]["proxy"] = min(
+            2.0, next_tuning["mutation_weights"]["proxy"] + 0.1
+        )
+    if avg["elements_transitions"] == 0 and pattern_avg["elements_transition"] == 0:
+        next_tuning["attack_weights"]["typed"] = min(
+            2.0, next_tuning["attack_weights"]["typed"] + 0.1
+        )
+        next_tuning["mutation_weights"]["typed"] = min(
+            2.0, next_tuning["mutation_weights"]["typed"] + 0.1
+        )
+    if pattern_avg["allocation"] > 5:
+        next_tuning["spray_scale"] = min(2.0, next_tuning["spray_scale"] + 0.1)
+    if coverage_avg["blocks"] < 10:
+        next_tuning["attack_plan_scale"] = min(
+            1.6, next_tuning.get("attack_plan_scale", 1.0) + 0.1
+        )
+    if coverage_avg["ops"] < 10:
+        next_tuning["iterations_scale"] = min(
+            1.8, next_tuning.get("iterations_scale", 1.0) + 0.1
+        )
+    return next_tuning
 
 
 def run_case(d8_path: Path, js_path: Path, flags: list[str], timeout_s: int) -> tuple[int, str]:
@@ -203,6 +415,34 @@ def main() -> int:
     parser.add_argument("--iterations", type=int, default=50, help="Number of fuzz iterations")
     parser.add_argument("--timeout", type=int, default=30, help="Timeout per run (seconds)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument(
+        "--attacker-count",
+        type=int,
+        default=None,
+        help="Number of attacker functions to generate (default: random 1000-10000)",
+    )
+    parser.add_argument(
+        "--maglev-guided",
+        action="store_true",
+        help="Use Maglev output stats to steer generation and keep interesting cases",
+    )
+    parser.add_argument(
+        "--maglev-threshold",
+        type=int,
+        default=18,
+        help="Minimum Maglev score to keep non-crashing cases when guided",
+    )
+    parser.add_argument(
+        "--keep-interesting",
+        action="store_true",
+        help="Keep non-crashing cases that meet the Maglev score threshold",
+    )
+    parser.add_argument(
+        "--baseline-runs",
+        type=int,
+        default=5,
+        help="Number of initial runs to learn baseline patterns before targeting deviations",
+    )
     parser.add_argument("--flags", nargs="*", default=DEFAULT_FLAGS, help="Extra d8 flags")
     parser.add_argument(
         "--analyze-crashes",
@@ -221,13 +461,34 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rng = random.Random(args.seed)
+    tuning = {
+        "spray_scale": 1.0,
+        "attacker_scale": 1.0,
+        "attack_plan_scale": 1.0,
+        "iterations_scale": 1.0,
+        "spin_scale": 1.0,
+        "oob_scale": 1.0,
+        "attack_weights": init_attack_weights(),
+        "mutation_weights": init_mutation_weights(),
+    }
+    maglev_history: deque[dict[str, int]] = deque(maxlen=6)
+    pattern_history: deque[Counter] = deque(maxlen=6)
+    coverage_history: deque[dict[str, int]] = deque(maxlen=6)
+    baseline_patterns: list[Counter] = []
+    baseline_coverages: list[dict[str, int]] = []
+    baseline_stats: list[dict[str, int]] = []
 
     print(f"[+] Running {args.iterations} fuzz iterations")
 
     crashes = 0
     for i in range(args.iterations):
         case_id = f"case_{int(time.time())}_{i}_{rng.randint(1000,9999)}"
-        js_text, params = render_case(case_id, rng)
+        js_text, params, attack_names, mutation_names = render_case(
+            case_id,
+            rng,
+            args.attacker_count,
+            tuning if args.maglev_guided else None,
+        )
 
         js_path = out_dir / f"{case_id}.js"
         meta_path = out_dir / f"{case_id}.meta"
@@ -235,6 +496,11 @@ def main() -> int:
 
         js_path.write_text(js_text)
         meta_path.write_text("\n".join([f"{k}={v}" for k, v in params.items()]))
+        meta_path.write_text(
+            meta_path.read_text()
+            + f"\nattacks={','.join(attack_names)}\n"
+            + f"mutations={','.join(mutation_names)}\n"
+        )
 
         try:
             returncode, output = run_case(d8_path, js_path, args.flags, args.timeout)
@@ -244,14 +510,95 @@ def main() -> int:
 
         log_path.write_text(output)
 
+        if i == 0 or (i + 1) % max(1, args.iterations // 10) == 0:
+            print(
+                f"[PROGRESS] {i + 1}/{args.iterations} "
+                f"latest=case:{case_id} returncode={returncode}"
+            )
+
+        maglev_stats = {}
+        maglev_score = 0
+        pattern_stats = Counter()
+        coverage_stats = {}
+        deviation_score = 0.0
+        if args.maglev_guided:
+            maglev_stats = parse_maglev_output(output)
+            maglev_score = score_maglev(maglev_stats)
+            tuning = update_tuning(tuning, maglev_stats)
+            pattern_stats = detect_patterns(output)
+            coverage_stats = detect_coverage(output)
+            if len(baseline_patterns) < args.baseline_runs:
+                baseline_patterns.append(pattern_stats)
+                baseline_coverages.append(coverage_stats)
+                baseline_stats.append(maglev_stats)
+            else:
+                baseline_pattern_avg = Counter()
+                for entry in baseline_patterns:
+                    baseline_pattern_avg.update(entry)
+                for key in list(baseline_pattern_avg.keys()):
+                    baseline_pattern_avg[key] = (
+                        baseline_pattern_avg[key] / len(baseline_patterns)
+                    )
+                baseline_coverage_avg = Counter()
+                for entry in baseline_coverages:
+                    baseline_coverage_avg.update(entry)
+                for key in list(baseline_coverage_avg.keys()):
+                    baseline_coverage_avg[key] = (
+                        baseline_coverage_avg[key] / len(baseline_coverages)
+                    )
+                combined_current = dict(pattern_stats)
+                combined_current.update(coverage_stats)
+                combined_baseline = dict(baseline_pattern_avg)
+                combined_baseline.update(baseline_coverage_avg)
+                deviation_score = compute_deviation_score(
+                    combined_current, combined_baseline
+                )
+            maglev_history.append(maglev_stats)
+            pattern_history.append(pattern_stats)
+            coverage_history.append(coverage_stats)
+            tuning = update_tuning_from_history(
+                tuning, maglev_history, pattern_history, coverage_history
+            )
+            print(
+                f"[MAGLEV] {case_id} score={maglev_score} deviation={deviation_score:.2f} "
+                f"stats={maglev_stats} coverage={coverage_stats}"
+            )
+            meta_path.write_text(
+                meta_path.read_text()
+                + "\n"
+                + "\n".join([f"maglev_{k}={v}" for k, v in maglev_stats.items()])
+                + f"\nmaglev_score={maglev_score}\n"
+                + "\n".join([f"pattern_{k}={v}" for k, v in pattern_stats.items()])
+                + "\n"
+                + "\n".join(
+                    [f"coverage_{k}={v}" for k, v in coverage_stats.items()]
+                )
+                + f"\ndeviation_score={deviation_score:.2f}\n"
+            )
+
         if is_crash(returncode, output):
             crashes += 1
+            sanitized_output = output.replace("*/", "* /")
+            with js_path.open("a", encoding="utf-8") as js_file:
+                js_file.write("\n/*\nD8 OUTPUT\n")
+                js_file.write(sanitized_output)
+                js_file.write("\n*/\n")
             print(f"[CRASH] {case_id} returncode={returncode}")
         else:
-            # Clean up non-crashes to keep output concise
-            js_path.unlink(missing_ok=True)
-            meta_path.unlink(missing_ok=True)
-            log_path.unlink(missing_ok=True)
+            keep_interesting = (
+                args.maglev_guided
+                and args.keep_interesting
+                and maglev_score >= args.maglev_threshold
+            )
+            if keep_interesting:
+                print(
+                    f"[INTERESTING] {case_id} maglev_score={maglev_score} stats={maglev_stats}"
+                )
+            else:
+                # Clean up non-crashes to keep output concise
+                js_path.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+                log_path.unlink(missing_ok=True)
 
     if args.analyze_crashes and crashes:
         print("[+] Analyzing crash logs...")
